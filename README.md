@@ -44,7 +44,7 @@ flowchart LR
 ## Quick start
 
 ```bash
-git clone <REPO_URL> trust-store-audit && cd trust-store-audit
+git clone https://github.com/leighsrodney-prog/trust-store-audit trust-store-audit && cd trust-store-audit
 ./trust-store-audit audit             # eMudhra 2026 preset, read-only
 ./trust-store-audit audit --live      # also try TLS to the published test hosts
 ./trust-store-audit audit --json      # machine-readable
