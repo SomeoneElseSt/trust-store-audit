@@ -150,6 +150,23 @@ class TestSweeps(unittest.TestCase):
             ("dockerfile", "python:3.12-slim"): "REBUILD",
         })
 
+    def test_fix_macos_layout_removes_whole_entry_and_empty_group(self):
+        """macOS cert.pem: '### group', '=== subject', a text dump containing
+        blank lines, then the PEM. Nothing of a removed entry may remain."""
+        good1, good2 = (FIX / "good1.pem").read_text(), (FIX / "good2.pem").read_text()
+        aaa = entry("AAA Certificate Services")["pem"] + "\n"
+        dump = "Certificate:\n    Data:\n\n        Version: 3\n\n    Signature: x\n\nSHA256 Fingerprint=AA\n"
+        text = ("# $OpenBSD: cert.pem $\n### Good Org\n\n"
+                f"=== /CN=good1\n{dump}{good1}\n=== /CN=good2\n{dump}{good2}\n"
+                f"### Comodo CA Limited\n\n=== /CN=AAA Certificate Services\n{dump}{aaa}\n"
+                "### Last Org\n\n=== /CN=last\n" + dump + good1)
+        new, before, removed, after = tsa.filter_bundle(text, self.lookup)
+        self.assertEqual((before, len(removed), after), (4, 1, 3))
+        self.assertNotIn("AAA", new)
+        self.assertNotIn("Comodo", new)
+        self.assertNotIn("\n\n\n", new)
+        self.assertEqual(new, text.replace(f"### Comodo CA Limited\n\n=== /CN=AAA Certificate Services\n{dump}{aaa}\n", ""))
+
     def test_fix_removes_intermediate_by_key(self):
         target = self.tmp / "cert.pem"
         target.write_text((FIX / "clean.pem").read_text() + "# cross\n"

@@ -39,6 +39,10 @@ HERE = Path(__file__).resolve().parent
 DEBIAN_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 MACOS_CERT_PEM = "/etc/ssl/cert.pem"
 MACOS_ROOTS_KEYCHAIN = "/System/Library/Keychains/SystemRootCertificates.keychain"
+PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
+PEM_END = "-----END CERTIFICATE-----"
+ENTRY_HEADER = "=== "  # macOS /etc/ssl/cert.pem entry header
+GROUP_HEADER = "### "  # macOS /etc/ssl/cert.pem organization header
 PROBLEM_STATUSES = {"PRESENT", tsa_versions.OUTDATED}
 QUIET_STATUSES = {"absent", tsa_versions.OK, "REBUILD"}
 
@@ -381,19 +385,74 @@ def live_tests(hosts, results) -> list[dict]:
 
 
 # ------------------------------------------------------------------------- fix
+def block_spans(lines: list[str]) -> list[tuple[int, int]]:
+    """(begin, end) line indexes of every PEM certificate block."""
+    spans, begin = [], None
+    for i, line in enumerate(lines):
+        if line.startswith(PEM_BEGIN):
+            begin = i
+        elif line.startswith(PEM_END) and begin is not None:
+            spans.append((begin, i))
+            begin = None
+    return spans
+
+
+def entry_start(lines: list[str], begin: int, floor: int) -> int:
+    """First line of the entry owning the block at begin. macOS cert.pem entries
+    start at a '=== /subject' line followed by an openssl text dump that contains
+    blank lines; other bundles have label lines directly above the block."""
+    for i in range(begin - 1, floor - 1, -1):
+        if lines[i].startswith(ENTRY_HEADER):
+            return i
+    start = begin
+    while start > floor and lines[start - 1].strip() and not lines[start - 1].startswith("-"):
+        start -= 1
+    return start
+
+
+def certless_groups(lines: list[str], drop: set[int]) -> set[int]:
+    """Indexes of '### group' header lines with no certificate left under them."""
+    empty, current, has_cert = set(), None, False
+    for i, line in enumerate(lines):
+        if i in drop:
+            continue
+        if line.startswith(GROUP_HEADER):
+            if current is not None and not has_cert:
+                empty.add(current)
+            current, has_cert = i, False
+        elif line.startswith(PEM_BEGIN):
+            has_cert = True
+    if current is not None and not has_cert:
+        empty.add(current)
+    return empty
+
+
+def drop_with_blank(lines: list[str], idx: int, drop: set[int]):
+    drop.add(idx)
+    if idx + 1 < len(lines) and not lines[idx + 1].strip():
+        drop.add(idx + 1)
+
+
 def filter_bundle(text: str, bad: dict[str, str]):
-    """Return (new_text, before, removed_fps, after). Drops each matching block
-    plus the label/comment lines directly above it."""
-    blocks = pem_blocks(text)
+    """Return (new_text, before, removed_fps, after). Drops each matching
+    certificate with its whole entry (labels or macOS '===' header and text
+    dump), and any '###' group header that loses its last certificate."""
+    lines = text.splitlines(keepends=True)
+    spans = block_spans(lines)
+    drop: set[int] = set()
     removed = []
-    res = text
-    for b in blocks:
-        fp = block_hit(b, bad)
+    prev_end = -1
+    for begin, end in spans:
+        fp = block_hit("".join(lines[begin:end + 1]), bad)
         if fp:
             removed.append(fp)
-            res = re.sub(r"(?:^[^\n-][^\n]*\n)*" + re.escape(b), "", res, count=1, flags=re.M)
-    after = pem_blocks(res)
-    return res, len(blocks), removed, len(after)
+            drop.update(range(entry_start(lines, begin, prev_end + 1), end))
+            drop_with_blank(lines, end, drop)
+        prev_end = end
+    for idx in certless_groups(lines, drop) - certless_groups(lines, set()):
+        drop_with_blank(lines, idx, drop)
+    res = "".join(line for i, line in enumerate(lines) if i not in drop)
+    return res, len(spans), removed, len(pem_blocks(res))
 
 
 def verify_filter(before, removed, after, new_text, bad, expect):
