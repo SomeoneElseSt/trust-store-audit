@@ -154,6 +154,12 @@ the system store:
 ./trust-store-audit node-guidance
 ```
 
+`--use-openssl-ca` reads the default CA file of the OpenSSL Node was built
+with. For Homebrew's Node that is Homebrew's `ca-certificates` bundle
+(`$(brew --prefix)/etc/openssl@3/cert.pem`), **not** `/etc/ssl/cert.pem`, so
+upgrade Homebrew's `ca-certificates` too (or set `SSL_CERT_FILE` to a patched
+bundle) and confirm with `--live`.
+
 `tls.rootCertificates` always lists the bundled roots, so the audit keeps
 reporting Node as `PRESENT` even with the flag set. Use `--live` to compare
 `node bundled` with `node --use-openssl-ca`.

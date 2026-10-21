@@ -55,7 +55,11 @@ the root, tell Node to use the (patched) system store instead:
     export NODE_OPTIONS
 
 or source contrib/node-use-openssl-ca.sh, which appends the flag only once.
-On macOS, --use-openssl-ca reads /etc/ssl/cert.pem (OpenSSL's default file).
+--use-openssl-ca reads the default CA file of the OpenSSL that Node was built
+with, which is NOT always the system store. Homebrew's Node reads
+$(brew --prefix)/etc/openssl@3/cert.pem (Homebrew's ca-certificates; patched
+from 2026-09-25_1), not /etc/ssl/cert.pem. Other builds use their own compiled-in
+OpenSSL directory. To pin it, also set SSL_CERT_FILE to a patched bundle.
 Note: tls.rootCertificates always lists the bundled roots, even with the flag,
 so the audit keeps reporting Node as PRESENT. Verify the flag with a live test
 instead: trust-store-audit audit --live (compare "node bundled" with
