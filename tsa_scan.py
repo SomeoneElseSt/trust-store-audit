@@ -31,6 +31,7 @@ ELECTRON_FRAMEWORK = "Contents/Frameworks/Electron Framework.framework"
 ELECTRON_BINARY = "Versions/A/Electron Framework"
 ELECTRON_PLIST = "Resources/Info.plist"
 APP_DIRS = ("/Applications", "~/Applications")
+NESTED_APP_GLOB = "Contents/*/*.app"  # apps bundled inside apps (MacOS/, Resources/, Helpers/)
 CLI_TOOLS = {  # tool -> (version args, embeds its own roots?)
     "node": (["--version"], True),
     "uv": (["--version"], True),
@@ -196,8 +197,10 @@ def electron_apps() -> list[Path]:
     apps = []
     for d in APP_DIRS:
         for app in sorted(Path(d).expanduser().glob("*.app")):
-            if (app / ELECTRON_FRAMEWORK).is_dir():
-                apps.append(app)
+            # Some apps nest their Electron app inside (e.g. Docker.app/Contents/MacOS/Docker Desktop.app).
+            for candidate in [app, *sorted(app.glob(NESTED_APP_GLOB))]:
+                if (candidate / ELECTRON_FRAMEWORK).is_dir():
+                    apps.append(candidate)
     return apps
 
 
