@@ -20,13 +20,13 @@ where the roots are still trusted, and can safely patch PEM bundles.
 
 ```mermaid
 flowchart LR
-  L[fingerprint list<br/>preset or your own] --> A[trust-store-audit audit]
+  L["fingerprint list<br/>preset or your own"] --> A[trust-store-audit audit]
   A --> S1[system bundle]
   A --> S2[certifi]
   A --> S3[Node bundled roots]
   A --> S4[keychain / Java]
-  A -- --live --> H[known-bad test hosts]
-  A -- PRESENT in a PEM bundle --> F[fix: dry run, then --apply<br/>backup, exact-count check, undo script]
+  A -->|"--live"| H[known-bad test hosts]
+  A -->|"PRESENT in a PEM bundle"| F["fix: dry run, then --apply<br/>backup, exact-count check, undo script"]
 ```
 
 ## Why
