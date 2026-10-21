@@ -160,6 +160,12 @@ with. For Homebrew's Node that is Homebrew's `ca-certificates` bundle
 upgrade Homebrew's `ca-certificates` too (or set `SSL_CERT_FILE` to a patched
 bundle) and confirm with `--live`.
 
+**Official nodejs.org builds on macOS** (including Node copies bundled by tools
+such as Codex or cursor-agent) have no OpenSSL store at their compiled-in path:
+`--use-openssl-ca` alone makes every HTTPS request fail. Always pair it with
+`SSL_CERT_FILE` pointing at a patched bundle, e.g.
+`export SSL_CERT_FILE=/etc/ssl/cert.pem`.
+
 `tls.rootCertificates` always lists the bundled roots, so the audit keeps
 reporting Node as `PRESENT` even with the flag set. Use `--live` to compare
 `node bundled` with `node --use-openssl-ca`.
