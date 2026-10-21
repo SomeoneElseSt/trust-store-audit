@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""trust-store-audit: find (and optionally remove) distrusted root CAs by SHA-256
+fingerprint across the trust stores on a Linux or macOS machine.
+
+Python standard library only. Dry run by default; nothing is changed without
+--apply, and sudo is only ever used with --apply.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+PEM_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----\s.*?-----END CERTIFICATE-----\n?", re.S
+)
+HEX64 = re.compile(r"^[0-9A-F]{64}$")
+HERE = Path(__file__).resolve().parent
+
+DEBIAN_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+MACOS_CERT_PEM = "/etc/ssl/cert.pem"
+MACOS_ROOTS_KEYCHAIN = "/System/Library/Keychains/SystemRootCertificates.keychain"
+
+NODE_GUIDANCE = """\
+Node.js ships its own copy of the Mozilla roots inside the binary, so removing a
+root from the system store does not affect Node. Until your Node release drops
+the root, tell Node to use the (patched) system store instead:
+
+    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--use-openssl-ca"   # e.g. in ~/.profile
+    export NODE_OPTIONS
+
+or source contrib/node-use-openssl-ca.sh, which appends the flag only once.
+On macOS, --use-openssl-ca reads /etc/ssl/cert.pem (OpenSSL's default file).
+Note: tls.rootCertificates always lists the bundled roots, even with the flag,
+so the audit keeps reporting Node as PRESENT. Verify the flag with a live test
+instead: trust-store-audit audit --live (compare "node bundled" with
+"node --use-openssl-ca")."""
+
+
+# --------------------------------------------------------------------- parsing
+def normalize_fp(text: str) -> str:
+    fp = re.sub(r"[\s:]", "", text).upper()
+    if not HEX64.match(fp):
+        raise ValueError(f"not a SHA-256 fingerprint: {text!r}")
+    return fp
+
+
+def load_fingerprints(path: str) -> dict[str, str]:
+    """Read 'FINGERPRINT  optional label' lines; '#' starts a comment line."""
+    out: dict[str, str] = {}
+    for n, raw in enumerate(Path(path).read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        try:
+            fp = normalize_fp(parts[0])
+        except ValueError as exc:
+            print(f"{path}:{n}: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        out[fp] = parts[1].strip() if len(parts) > 1 else ""
+    if not out:
+        print(f"{path}: no fingerprints found", file=sys.stderr)
+        raise SystemExit(2)
+    return out
+
+
+def load_hosts(path: str) -> list[str]:
+    hosts = []
+    for raw in Path(path).read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            hosts.append(line)
+    return hosts
+
+
+def pem_blocks(text: str) -> list[str]:
+    return PEM_RE.findall(text)
+
+
+def pem_fp(block: str) -> str:
+    der = ssl.PEM_cert_to_DER_cert(block.strip())
+    return hashlib.sha256(der).hexdigest().upper()
+
+
+def fps_from_pem_text(text: str) -> list[str]:
+    fps = []
+    for b in pem_blocks(text):
+        try:
+            fps.append(pem_fp(b))
+        except ValueError:
+            continue
+    return fps
+
+
+def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+# ---------------------------------------------------------------------- stores
+def store_result(name, kind, location, version, fps, bad, note=""):
+    found = sorted({fp for fp in fps if fp in bad})
+    return {
+        "store": name,
+        "kind": kind,
+        "location": location,
+        "version": version,
+        "total": len(fps),
+        "status": "PRESENT" if found else "absent",
+        "found": [{"sha256": fp, "label": bad[fp]} for fp in found],
+        "note": note,
+    }
+
+
+def skipped(name, why):
+    return {"store": name, "status": "skipped", "note": why, "found": []}
+
+
+def audit_pem_file(name, path, version, bad, kind="pem-file"):
+    p = Path(path)
+    if not p.is_file():
+        return skipped(name, f"{path} not found")
+    try:
+        text = p.read_text(errors="replace")
+    except OSError as exc:
+        return skipped(name, f"cannot read {path}: {exc.strerror}")
+    return store_result(name, kind, path, version, fps_from_pem_text(text), bad)
+
+
+def debian_version():
+    if shutil.which("dpkg-query"):
+        r = run(["dpkg-query", "-W", "-f=${Version}", "ca-certificates"])
+        if r.returncode == 0 and r.stdout.strip():
+            return "ca-certificates " + r.stdout.strip()
+    return "unknown"
+
+
+def macos_version():
+    if shutil.which("sw_vers"):
+        r = run(["sw_vers", "-productVersion"])
+        if r.returncode == 0:
+            return "macOS " + r.stdout.strip()
+    return "unknown"
+
+
+def audit_keychain(bad, keychain=MACOS_ROOTS_KEYCHAIN):
+    name = "macos-system-roots-keychain"
+    if not shutil.which("security") or not Path(keychain).exists():
+        return skipped(name, "macOS security tool or keychain not found")
+    r = run(["security", "find-certificate", "-a", "-p", keychain])
+    if r.returncode != 0:
+        return skipped(name, "security find-certificate failed")
+    res = store_result(name, "keychain", keychain, macos_version(),
+                       fps_from_pem_text(r.stdout), bad,
+                       note="read-only; Apple manages this keychain (fix via OS update)")
+    return res
+
+
+def audit_certifi(bad, pythons):
+    results = []
+    code = "import certifi,sys;print(certifi.where());print(certifi.__version__)"
+    seen = set()
+    for py in pythons:
+        exe = shutil.which(py) or (py if Path(py).is_file() else None)
+        name = f"certifi ({py})"
+        if not exe:
+            results.append(skipped(name, f"{py} not found"))
+            continue
+        try:
+            r = run([exe, "-c", code])
+        except (OSError, subprocess.TimeoutExpired):
+            results.append(skipped(name, "could not run interpreter"))
+            continue
+        if r.returncode != 0:
+            results.append(skipped(name, "certifi not installed"))
+            continue
+        where, ver = (r.stdout.strip().splitlines() + ["", ""])[:2]
+        if where in seen:
+            continue
+        seen.add(where)
+        results.append(audit_pem_file(name, where, "certifi " + ver, bad))
+    return results
+
+
+def audit_node(bad, node="node"):
+    name = "node-bundled-roots"
+    exe = shutil.which(node)
+    if not exe:
+        return skipped(name, "node not found")
+    # fs.writeSync avoids truncated output when stdout is a pipe (node -p is async).
+    cmd = [exe, "-e", "require('fs').writeSync(1, JSON.stringify("
+           "{v:process.version,c:require('tls').rootCertificates}))"]
+    # Run with a clean NODE_OPTIONS so the bundled store is what we measure.
+    envv = {k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"}
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=envv)
+    if r.returncode != 0:
+        return skipped(name, "node failed to print tls.rootCertificates")
+    data = json.loads(r.stdout)
+    fps = fps_from_pem_text("\n".join(data["c"]))
+    note = "compiled into the binary; see Node guidance"
+    if "--use-openssl-ca" in os.environ.get("NODE_OPTIONS", ""):
+        note += "; NODE_OPTIONS sets --use-openssl-ca in this shell"
+    return store_result(name, "node", exe, "node " + data["v"], fps, bad, note)
+
+
+def java_cacerts_candidates():
+    cands = []
+    jh = os.environ.get("JAVA_HOME")
+    if jh:
+        cands += [Path(jh, "lib/security/cacerts"), Path(jh, "jre/lib/security/cacerts")]
+    java = shutil.which("java")
+    if java:
+        home = Path(os.path.realpath(java)).parent.parent
+        cands += [home / "lib/security/cacerts", home / "jre/lib/security/cacerts"]
+    cands.append(Path("/etc/ssl/certs/java/cacerts"))
+    out = []
+    for c in cands:
+        if c.is_file() and c.resolve() not in [o.resolve() for o in out]:
+            out.append(c)
+    return out
+
+
+def parse_keytool(text: str) -> list[str]:
+    fps = []
+    for m in re.finditer(r"SHA-?256\)?:\s*([0-9A-Fa-f:]{95})", text):
+        fps.append(normalize_fp(m.group(1)))
+    return fps
+
+
+def audit_java(bad, storepass="changeit"):
+    keytool = shutil.which("keytool")
+    stores = java_cacerts_candidates()
+    if not stores:
+        return [skipped("java-cacerts", "no Java cacerts found")]
+    if not keytool:
+        return [skipped("java-cacerts", "keytool not found")]
+    ver = "unknown"
+    if shutil.which("java"):
+        r = run(["java", "-version"])
+        ver = (r.stderr.strip().splitlines() or ["unknown"])[0]
+    out = []
+    for s in stores:
+        r = run([keytool, "-list", "-v", "-keystore", str(s), "-storepass", storepass])
+        if r.returncode != 0:
+            out.append(skipped(f"java-cacerts ({s})", "keytool -list failed"))
+            continue
+        fps = parse_keytool(r.stdout)
+        out.append(store_result("java-cacerts", "java", str(s), ver, fps, bad,
+                                note="fix: keytool -delete -alias <alias> (needs --apply by hand)"))
+    return out
+
+
+def audit_all(bad, args) -> list[dict]:
+    results = []
+    if args.bundle:
+        for b in args.bundle:
+            results.append(audit_pem_file(f"custom ({b})", b, "n/a", bad))
+        if args.only_bundles:
+            return results
+    results.append(audit_pem_file("debian-system-bundle", DEBIAN_BUNDLE, debian_version(), bad))
+    results.append(audit_pem_file("macos-cert.pem", MACOS_CERT_PEM, macos_version(), bad))
+    results.append(audit_keychain(bad))
+    results.extend(audit_certifi(bad, args.python))
+    results.append(audit_node(bad))
+    results.extend(audit_java(bad))
+    return results
+
+
+# ------------------------------------------------------------------------ live
+def live_python(host: str, cafile: str | None, timeout=10) -> str:
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    try:
+        with socket.create_connection((host, 443), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=host):
+                return "ACCEPTED"
+    except ssl.SSLCertVerificationError:
+        return "rejected"
+    except (OSError, ssl.SSLError) as exc:
+        return f"error ({type(exc).__name__})"
+
+
+def live_node(host: str, use_openssl_ca: bool, timeout=15) -> str:
+    exe = shutil.which("node")
+    if not exe:
+        return "skipped"
+    js = ("const t=require('tls');const s=t.connect({host:process.argv[1],port:443,"
+          "servername:process.argv[1]},()=>{console.log('ACCEPTED');s.end()});"
+          "s.on('error',e=>{console.log(/CERT|UNABLE|SELF_SIGNED|verify/i.test(e.code+e.message)"
+          "?'rejected':'error ('+e.code+')')});s.setTimeout(10000,()=>{console.log('error (timeout)');s.destroy()})")
+    cmd = [exe] + (["--use-openssl-ca"] if use_openssl_ca else []) + ["-e", js, host]
+    envv = {k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=envv)
+        return (r.stdout.strip().splitlines() or ["error"])[0]
+    except subprocess.TimeoutExpired:
+        return "error (timeout)"
+
+
+def live_tests(hosts, results) -> list[dict]:
+    clients = [("python default", lambda h: live_python(h, None))]
+    for r in results:
+        if r.get("kind") == "pem-file":
+            loc = r["location"]
+            clients.append((f"python cafile={r['store']}", lambda h, loc=loc: live_python(h, loc)))
+    if shutil.which("node"):
+        clients.append(("node bundled", lambda h: live_node(h, False)))
+        clients.append(("node --use-openssl-ca", lambda h: live_node(h, True)))
+    rows = []
+    for h in hosts:
+        for cname, fn in clients:
+            rows.append({"host": h, "client": cname, "result": fn(h)})
+    return rows
+
+
+# ------------------------------------------------------------------------- fix
+def filter_bundle(text: str, bad: dict[str, str]):
+    """Return (new_text, before, removed_fps, after). Drops each matching block
+    plus the label/comment lines directly above it."""
+    blocks = pem_blocks(text)
+    removed = []
+    res = text
+    for b in blocks:
+        try:
+            fp = pem_fp(b)
+        except ValueError:
+            continue
+        if fp in bad:
+            removed.append(fp)
+            res = re.sub(r"(?:^[^\n-][^\n]*\n)*" + re.escape(b), "", res, count=1, flags=re.M)
+    after = pem_blocks(res)
+    return res, len(blocks), removed, len(after)
+
+
+def verify_filter(before, removed, after, new_text, bad, expect):
+    if expect is not None and len(removed) != expect:
+        return f"expected to remove exactly {expect}, matched {len(removed)}"
+    if after != before - len(removed):
+        return f"count mismatch: before={before} removed={len(removed)} after={after}"
+    if any(fp in bad for fp in fps_from_pem_text(new_text)):
+        return "a distrusted root is still present after filtering"
+    return None
+
+
+def write_undo(undo_path: Path, backup: Path, target: Path, mode: int, needs_sudo: bool):
+    sudo = "sudo " if needs_sudo else ""
+    undo_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "# Restore the trust bundle saved by trust-store-audit fix --apply.\n"
+        "set -euo pipefail\n"
+        f"{sudo}install -m {mode:o} {shlex.quote(str(backup))} {shlex.quote(str(target))}\n"
+        f"grep -c 'BEGIN CERTIFICATE' {shlex.quote(str(target))}\n"
+    )
+    undo_path.chmod(0o755)
+
+
+def cmd_fix(args, bad) -> int:
+    target = Path(args.target)
+    if not target.is_file():
+        print(f"ABORT: {target} not found", file=sys.stderr)
+        return 2
+    text = target.read_text()
+    new_text, before, removed, after = filter_bundle(text, bad)
+    print(f"target={target} before={before} removed={len(removed)} after={after}")
+    for fp in removed:
+        print(f"  remove {fp}  {bad[fp]}")
+    err = verify_filter(before, removed, after, new_text, bad, args.expect)
+    if err:
+        print(f"ABORT: {err}; nothing changed", file=sys.stderr)
+        return 3
+    if not removed:
+        print("Nothing to remove; store is clean.")
+        print("\n" + NODE_GUIDANCE)
+        return 0
+    if not args.apply:
+        print("DRY RUN: nothing changed. Re-run with --apply to back up, install and write undo.")
+        print("\n" + NODE_GUIDANCE)
+        return 0
+
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bdir = Path(args.backup_dir).expanduser()
+    bdir.mkdir(parents=True, exist_ok=True)
+    backup = bdir / f"{target.name}.bak-{ts}"
+    filtered = bdir / f"{target.name}.filtered-{ts}"
+    shutil.copy2(target, backup)
+    if fps_from_pem_text(backup.read_text()) != fps_from_pem_text(text):
+        print("ABORT: backup does not match the original; nothing changed", file=sys.stderr)
+        return 3
+    filtered.write_text(new_text)
+    mode = target.stat().st_mode & 0o777
+    needs_sudo = not os.access(target, os.W_OK)
+    if needs_sudo:
+        if not shutil.which("sudo"):
+            print("ABORT: target not writable and sudo not available", file=sys.stderr)
+            return 3
+        st = target.stat()
+        cmd = ["sudo", "install", "-m", f"{mode:o}", "-o", str(st.st_uid), "-g", str(st.st_gid),
+               str(filtered), str(target)]
+    else:
+        cmd = ["install", "-m", f"{mode:o}", str(filtered), str(target)]
+    undo = bdir / f"undo-{target.name}-{ts}.sh"
+    write_undo(undo, backup, target, mode, needs_sudo)
+    print(f"Backup: {backup}\nUndo:   bash {undo}")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        print("ABORT: install failed; original left in place", file=sys.stderr)
+        return 3
+    left = [fp for fp in fps_from_pem_text(target.read_text()) if fp in bad]
+    if left:
+        print("ERROR: distrusted root still present after install; run the undo script",
+              file=sys.stderr)
+        return 3
+    print("Installed and verified.")
+    if str(target) == DEBIAN_BUNDLE:
+        print("Note: update-ca-certificates regenerates this file. To make it stick, also\n"
+              "deselect the roots in /etc/ca-certificates.conf (prefix with '!').")
+    if str(target) == MACOS_CERT_PEM:
+        print("Note: macOS updates may restore /etc/ssl/cert.pem; re-run after updates.")
+    print("\n" + NODE_GUIDANCE)
+    return 0
+
+
+# ------------------------------------------------------------------------- cli
+def print_table(results):
+    print(f"{'STORE':34} {'STATUS':8} {'CERTS':>5}  VERSION")
+    for r in results:
+        print(f"{r['store'][:34]:34} {r['status']:8} {str(r.get('total', '-')):>5}  "
+              f"{r.get('version', '')}")
+        if r.get("location"):
+            print(f"{'':34}   at {r['location']}")
+        for f in r["found"]:
+            print(f"{'':34}   ! {f['sha256']}  {f['label']}")
+        if r.get("note"):
+            print(f"{'':34}   ({r['note']})")
+
+
+def default_preset():
+    return str(HERE / "presets" / "emudhra-2026.txt")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="trust-store-audit", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=__version__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--fingerprints", "-f", default=default_preset(),
+                       help="file of SHA-256 fingerprints (default: eMudhra 2026 preset)")
+
+    a = sub.add_parser("audit", help="report distrusted roots per store (read-only)")
+    common(a)
+    a.add_argument("--bundle", action="append", help="also audit this PEM bundle (repeatable)")
+    a.add_argument("--only-bundles", action="store_true", help="audit only --bundle files")
+    a.add_argument("--python", action="append", default=None,
+                   help="interpreter(s) to check for certifi (default: python3)")
+    a.add_argument("--live", action="store_true", help="also test live TLS to known-bad hosts")
+    a.add_argument("--hosts", default=str(HERE / "presets" / "emudhra-2026-hosts.txt"))
+    a.add_argument("--json", action="store_true", help="JSON output")
+
+    f = sub.add_parser("fix", help="remove distrusted roots from one PEM bundle")
+    common(f)
+    f.add_argument("target", help="PEM bundle, e.g. /etc/ssl/cert.pem")
+    f.add_argument("--expect", type=int, default=None,
+                   help="abort unless exactly this many certificates match")
+    f.add_argument("--apply", action="store_true", help="really change the file (may use sudo)")
+    f.add_argument("--backup-dir", default="~/.trust-store-audit")
+
+    sub.add_parser("node-guidance", help="print how to make Node use the system store")
+
+    args = ap.parse_args(argv)
+    if args.cmd == "node-guidance":
+        print(NODE_GUIDANCE)
+        return 0
+    bad = load_fingerprints(args.fingerprints)
+    if args.cmd == "fix":
+        return cmd_fix(args, bad)
+
+    args.python = args.python or ["python3"]
+    results = audit_all(bad, args)
+    live = live_tests(load_hosts(args.hosts), results) if args.live else []
+    if args.json:
+        print(json.dumps({"version": __version__, "fingerprints": len(bad),
+                          "stores": results, "live": live}, indent=2))
+    else:
+        print(f"trust-store-audit {__version__}: checking {len(bad)} fingerprint(s)\n")
+        print_table(results)
+        if live:
+            print(f"\n{'HOST':48} {'CLIENT':40} RESULT")
+            for row in live:
+                print(f"{row['host'][:48]:48} {row['client'][:40]:40} {row['result']}")
+        if any(r["status"] == "PRESENT" and r["kind"] == "node" for r in results):
+            print("\n" + NODE_GUIDANCE)
+    present = any(r["status"] == "PRESENT" for r in results)
+    accepted = any(row["result"] == "ACCEPTED" for row in live)
+    return 1 if (present or accepted) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

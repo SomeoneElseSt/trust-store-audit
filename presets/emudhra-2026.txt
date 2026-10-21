@@ -1,0 +1,4 @@
+# eMudhra roots distrusted, October 2026 (see Mozilla bug 2083449).
+# Format: SHA-256 fingerprint (hex, colons optional), then an optional label.
+86A1ECBA089C4A8D3BBE2734C612BA341D813E043CF9E8A862CD5C57A36BBE6B  emSign ECC Root CA - G3
+D7A7A0FB5D7E2731D771E9484EBCDEF71D5F0C3E0A2948782BC83EE0EA699EF4  AAA Certificate Services

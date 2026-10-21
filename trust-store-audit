@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper so the tool can be run from anywhere: trust-store-audit audit
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+exec python3 "$here/trust_store_audit.py" "$@"

@@ -1,0 +1,14 @@
+# Public test hosts published for the eMudhra 2026 incident (https://emudhra.we-have-a-problem.com/).
+# A patched client should REJECT every one of these.
+dv-g3b-emudhra.we-have-a-problem.com
+dv-g3b-aaa-emudhra.we-have-a-problem.com
+dv-g3c-emudhra.we-have-a-problem.com
+dv-g3c-aaa-emudhra.we-have-a-problem.com
+ov-g3b-emudhra.we-have-a-problem.com
+ov-g3b-aaa-emudhra.we-have-a-problem.com
+ov-g3c-emudhra.we-have-a-problem.com
+ov-g3c-aaa-emudhra.we-have-a-problem.com
+ev-g3b-emudhra.we-have-a-problem.com
+ev-g3b-aaa-emudhra.we-have-a-problem.com
+ev-g3c-emudhra.we-have-a-problem.com
+ev-g3c-aaa-emudhra.we-have-a-problem.com
