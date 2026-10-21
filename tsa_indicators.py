@@ -16,6 +16,10 @@ PEM_RE = re.compile(r"-----BEGIN CERTIFICATE-----\s.*?-----END CERTIFICATE-----\
 SPKI_PREFIX = "SPKI:"
 PEM_LINE_SAMPLES = (3, 6)  # base64 lines of each PEM searched for in binaries
 MIN_PEM_LINES = 8
+DER_PREFIX_BYTES = 120  # start of the certificate DER (version, serial, issuer): the cert itself
+# Patched verifiers (rustls-webpki 0.103.16, Go 1.27.3) embed the compromised
+# intermediates' keys to *reject* them; a key without its certificate is a blocklist.
+BLOCKLIST_MARK = " [key only: distrust blocklist]"
 
 
 # ------------------------------------------------------------------------- DER
@@ -110,23 +114,35 @@ def first_match(keys: list[str], lookup: dict[str, str]) -> str | None:
 
 def binary_patterns(entries: list[dict]) -> list[tuple[bytes, str]]:
     """Byte patterns that reveal a certificate or key embedded in a binary:
-    the SPKI body (raw DER, JKS/PKCS12, webpki-roots) and sample PEM lines
-    (PEM strings compiled into Node, Electron and similar)."""
+    the certificate DER itself, the SPKI body (webpki-roots trust anchors for
+    roots; distrust blocklists for intermediates) and sample PEM lines (PEM
+    strings compiled into Node, Electron and similar)."""
     patterns: list[tuple[bytes, str]] = []
     for e in entries:
         der = der_from_pem(e["pem"])
         if not der:
             continue
         label = f"{e['name']} ({e['kind']})"
+        patterns.append((der[:DER_PREFIX_BYTES], label))
         spki = spki_der(der)
         if spki:
-            patterns.append((spki_content(spki), label))
+            # Trust stores carry roots as anchors (key + subject); an intermediate's
+            # key alone is what blocklists embed.
+            key_label = label if e["kind"] == "root" else label + BLOCKLIST_MARK
+            patterns.append((spki_content(spki), key_label))
         lines = [ln for ln in e["pem"].splitlines() if not ln.startswith("-----")]
         if len(lines) < MIN_PEM_LINES:
             continue
         for i in PEM_LINE_SAMPLES:
             patterns.append((lines[i].encode(), label))
     return patterns
+
+
+def trusted_labels(labels: list[str]) -> list[str]:
+    """Drop blocklist-only hits: an intermediate whose certificate was also found
+    stays; a key found without its certificate is the fix, not the problem."""
+    full = {lb for lb in labels if not lb.endswith(BLOCKLIST_MARK)}
+    return sorted(full)
 
 
 def valid_hex(text: str) -> bool:

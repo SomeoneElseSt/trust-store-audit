@@ -124,6 +124,17 @@ class TestSweeps(unittest.TestCase):
         self.assertEqual(tsa_scan.scan_binary(self.tmp / "webpki", self.patterns), [label])
         self.assertEqual(tsa_scan.scan_binary(self.tmp / "clean", self.patterns), [])
 
+    def test_blocklisted_key_is_not_trust(self):
+        """Patched verifiers embed the compromised intermediates' keys to reject
+        them (rustls-webpki 0.103.16 DISTRUSTED_SPKIS): key alone = not flagged."""
+        inter = ind.der_from_pem(entry("EM DV TLS CA - G3B")["pem"])
+        key = ind.spki_content(ind.spki_der(inter))
+        (self.tmp / "patched").write_bytes(b"\x00" * 64 + key + b"\x00" * 64)
+        (self.tmp / "trusting").write_bytes(b"\x00" * 64 + inter + b"\x00" * 64)
+        self.assertEqual(tsa_scan.scan_binary(self.tmp / "patched", self.patterns), [])
+        self.assertIn("EM DV TLS CA - G3B (intermediate)",
+                      tsa_scan.scan_binary(self.tmp / "trusting", self.patterns))
+
     def test_lockfiles(self):
         app = self.tmp / "app"
         app.mkdir()

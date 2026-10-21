@@ -81,7 +81,8 @@ def scan_binary(path: Path, patterns: list[tuple[bytes, str]]) -> list[str] | No
             if os.fstat(fh.fileno()).st_size == 0:
                 return []
             with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                return sorted({label for pat, label in patterns if mm.find(pat) != -1})
+                hits = {label for pat, label in patterns if mm.find(pat) != -1}
+                return ind.trusted_labels(list(hits))
     except (OSError, ValueError):
         return None
 
