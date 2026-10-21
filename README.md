@@ -1,5 +1,7 @@
 # trust-store-audit
 
+[![CI](https://github.com/leighsrodney-prog/trust-store-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/leighsrodney-prog/trust-store-audit/actions/workflows/ci.yml)
+
 Find, and optionally remove, distrusted root CAs across the common trust stores on a
 Linux or macOS machine (system bundle, macOS keychain, certifi, Node.js, Java), by SHA-256 fingerprint.
 
