@@ -1,3 +1,5 @@
+> **This project's home is now [github.com/globe-teck/trust-store-audit](https://github.com/globe-teck/trust-store-audit).** This copy stays up for existing links. Please open issues and pull requests there.
+
 # trust-store-audit
 
 [![CI](https://github.com/leighsrodney-prog/trust-store-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/leighsrodney-prog/trust-store-audit/actions/workflows/ci.yml)
