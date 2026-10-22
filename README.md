@@ -72,6 +72,39 @@ java-cacerts                       skipped      -
                                      (no Java cacerts found)
 ```
 
+## Full sweep (0.2, `full-sweep` branch)
+
+The default preset is now `presets/emudhra-2026.json`: all 16 compromised
+intermediates (including the AAA cross-signs) and the 4 roots they chain to,
+matched by certificate SHA-256 **and** by public-key (SPKI) SHA-256, so a
+re-issued certificate that reuses a compromised key is caught too. It is
+generated, never hand-edited, from the incident site's published data:
+
+```bash
+python3 tools/build_preset.py presets/sources presets/emudhra-2026.json   # re-derives and checks every hash
+```
+
+```bash
+python3 -I trust_store_audit.py audit --apps \
+  --projects ~/code \                         # bundles, keystores, venvs + lockfiles, Dockerfiles
+  --scan /opt/homebrew --scan /Applications \ # bundles, keystores, pip/certifi installs
+  --site example.com --ct example.com         # served chain + crt.sh
+```
+
+| Option        | What it checks |
+| ------------- | -------------- |
+| `--scan DIR`  | every CA bundle (`cacert.pem`, `roots.pem`, large `.pem/.crt`), Java keystore, and `pip`/`certifi` version (from `*.dist-info`) under DIR. Nothing found is executed. |
+| `--projects DIR` | `--scan`, plus lockfiles (npm, pnpm, yarn, bun, uv, poetry, Pipfile, requirements, Cargo, go.mod) against the patched-versions table, and Dockerfiles to rebuild |
+| `--apps`      | Electron apps in `/Applications` (version from the framework's `Info.plist`), `node`/`uv`/`go`/`rustup`/`bun`/`deno` versions, Node installs from nvm/fnm/volta/asdf/Homebrew, and roots embedded in binaries |
+| `--site HOST` | the chain HOST actually serves |
+| `--ct DOMAIN` | unexpired certificates for DOMAIN and subdomains issued under eMudhra (crt.sh) |
+
+Binary scanning looks for each certificate's SPKI bytes (raw DER, JKS/PKCS12,
+webpki-roots) and sample PEM lines (roots compiled into Node and Electron).
+Patched Electron still embeds the roots (the fix is a blocklist), so Electron
+verdicts come from the version. `presets/emudhra-2026-patched.json` mirrors the
+site's patched-versions table. Clean sweep results are hidden unless `-v`.
+
 ## Your own list
 
 The preset is `presets/emudhra-2026.txt`. Any file in the same format works:
@@ -122,6 +155,18 @@ the system store:
 . contrib/node-use-openssl-ca.sh     # appends --use-openssl-ca to NODE_OPTIONS once
 ./trust-store-audit node-guidance
 ```
+
+`--use-openssl-ca` reads the default CA file of the OpenSSL Node was built
+with. For Homebrew's Node that is Homebrew's `ca-certificates` bundle
+(`$(brew --prefix)/etc/openssl@3/cert.pem`), **not** `/etc/ssl/cert.pem`, so
+upgrade Homebrew's `ca-certificates` too (or set `SSL_CERT_FILE` to a patched
+bundle) and confirm with `--live`.
+
+**Official nodejs.org builds on macOS** (including Node copies bundled by tools
+such as Codex or cursor-agent) have no OpenSSL store at their compiled-in path:
+`--use-openssl-ca` alone makes every HTTPS request fail. Always pair it with
+`SSL_CERT_FILE` pointing at a patched bundle, e.g.
+`export SSL_CERT_FILE=/etc/ssl/cert.pem`.
 
 `tls.rootCertificates` always lists the bundled roots, so the audit keeps
 reporting Node as `PRESENT` even with the flag set. Use `--live` to compare

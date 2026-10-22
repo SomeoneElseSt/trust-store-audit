@@ -42,6 +42,12 @@ class TestParsing(unittest.TestCase):
         bad = tsa.load_fingerprints(tsa.default_preset())
         self.assertIn("86A1ECBA089C4A8D3BBE2734C612BA341D813E043CF9E8A862CD5C57A36BBE6B", bad)  # pragma: allowlist secret (public root CA fingerprint)
         self.assertIn("D7A7A0FB5D7E2731D771E9484EBCDEF71D5F0C3E0A2948782BC83EE0EA699EF4", bad)  # pragma: allowlist secret (public root CA fingerprint)
+        self.assertIn("42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493", bad)  # EM DV TLS CA - G3B
+        self.assertIn("SPKI:EBED6475C2C2D80FCB199F3FE8DD6E6B3CE60B77EB15D4E42C3DEC0C6F5B5105", bad)
+        self.assertEqual(sum(1 for k in bad if not k.startswith("SPKI:")), 20)
+
+    def test_text_preset_still_loads(self):
+        bad = tsa.load_fingerprints(ROOT / "presets" / "emudhra-2026.txt")
         self.assertEqual(len(bad), 2)
 
     def test_hosts_preset(self):
@@ -105,7 +111,8 @@ class TestAudit(unittest.TestCase):
             self.assertEqual(tsa.audit_node(self.bad)["status"], "skipped")
 
     def test_full_audit_runs_offline(self):
-        args = mock.Mock(bundle=None, only_bundles=False, python=[sys.executable])
+        args = mock.Mock(bundle=None, only_bundles=False, python=[sys.executable],
+                         scan=None, projects=None, apps=False, site=None, ct=None)
         results = tsa.audit_all(self.bad, args)
         names = [r["store"] for r in results]
         self.assertIn("debian-system-bundle", names)

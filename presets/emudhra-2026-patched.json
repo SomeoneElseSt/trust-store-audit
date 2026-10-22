@@ -1,0 +1,17 @@
+{
+ "source": "https://emudhra.we-have-a-problem.com/#developer (patched versions table, 2026-10-21)",
+ "comment": "Per release line: minimum patched version. Lines below the oldest listed line have no fix; newer lines are assumed fixed.",
+ "packages": {
+  "electron": {"line": "major", "min": {"42": "42.11.16", "43": "43.8.1", "44": "44.9.1"}},
+  "node": {"line": "major", "min": {"22": "22.23.4", "24": "24.22.1", "26": "26.12.1"}},
+  "go": {"line": "minor", "min": {"1.26": "1.26.10", "1.27": "1.27.3"}},
+  "certifi": {"line": "any", "min": {"*": "2026.10.19"}},
+  "pip": {"line": "any", "min": {"*": "26.2.2"}},
+  "uv": {"line": "any", "min": {"*": "0.13.4"}},
+  "rustls-webpki": {"line": "any", "min": {"*": "0.103.16"}},
+  "webpki-roots": {"line": "any", "min": {"*": "1.0.10"}},
+  "webpki-root-certs": {"line": "any", "min": {"*": "1.0.10"}},
+  "rustup": {"line": "any", "min": {"*": "1.29.2"}},
+  "bun": {"line": "any", "pending": true, "min": {}}
+ }
+}

@@ -21,7 +21,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-__version__ = "0.1.0"
+# Works under `python3 -I` (isolated mode), which drops the script directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tsa_indicators as ind  # noqa: E402
+import tsa_scan  # noqa: E402
+import tsa_sites  # noqa: E402
+import tsa_versions  # noqa: E402
+
+__version__ = "0.2.0"
 
 PEM_RE = re.compile(
     r"-----BEGIN CERTIFICATE-----\s.*?-----END CERTIFICATE-----\n?", re.S
@@ -32,6 +39,12 @@ HERE = Path(__file__).resolve().parent
 DEBIAN_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 MACOS_CERT_PEM = "/etc/ssl/cert.pem"
 MACOS_ROOTS_KEYCHAIN = "/System/Library/Keychains/SystemRootCertificates.keychain"
+PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
+PEM_END = "-----END CERTIFICATE-----"
+ENTRY_HEADER = "=== "  # macOS /etc/ssl/cert.pem entry header
+GROUP_HEADER = "### "  # macOS /etc/ssl/cert.pem organization header
+PROBLEM_STATUSES = {"PRESENT", tsa_versions.OUTDATED}
+QUIET_STATUSES = {"absent", tsa_versions.OK, "REBUILD"}
 
 NODE_GUIDANCE = """\
 Node.js ships its own copy of the Mozilla roots inside the binary, so removing a
@@ -42,7 +55,13 @@ the root, tell Node to use the (patched) system store instead:
     export NODE_OPTIONS
 
 or source contrib/node-use-openssl-ca.sh, which appends the flag only once.
-On macOS, --use-openssl-ca reads /etc/ssl/cert.pem (OpenSSL's default file).
+--use-openssl-ca reads the default CA file of the OpenSSL that Node was built
+with, which is NOT always the system store. Homebrew's Node reads
+$(brew --prefix)/etc/openssl@3/cert.pem (Homebrew's ca-certificates; patched
+from 2026-09-25_1), not /etc/ssl/cert.pem. Official nodejs.org builds (also
+bundled by tools such as Codex or cursor-agent) find NO store on macOS: with the
+flag alone every HTTPS request fails. Always pair the flag with SSL_CERT_FILE
+pointing at a patched bundle, e.g. export SSL_CERT_FILE=/etc/ssl/cert.pem.
 Note: tls.rootCertificates always lists the bundled roots, even with the flag,
 so the audit keeps reporting Node as PRESENT. Verify the flag with a live test
 instead: trust-store-audit audit --live (compare "node bundled" with
@@ -58,7 +77,10 @@ def normalize_fp(text: str) -> str:
 
 
 def load_fingerprints(path: str) -> dict[str, str]:
-    """Read 'FINGERPRINT  optional label' lines; '#' starts a comment line."""
+    """Read a JSON preset (certificate and key hashes) or a text file of
+    'FINGERPRINT  optional label' lines; '#' starts a comment line."""
+    if str(path).endswith(".json"):
+        return ind.load_preset_json(path)[0]
     out: dict[str, str] = {}
     for n, raw in enumerate(Path(path).read_text().splitlines(), 1):
         line = raw.strip()
@@ -105,19 +127,36 @@ def fps_from_pem_text(text: str) -> list[str]:
     return fps
 
 
+def keys_from_pem_text(text: str) -> list[list[str]]:
+    """Per certificate: [cert SHA-256, SPKI key] for matching by cert or by key."""
+    out = []
+    for b in pem_blocks(text):
+        der = ind.der_from_pem(b)
+        if der:
+            out.append(ind.cert_keys(der))
+    return out
+
+
+def block_hit(block: str, bad: dict[str, str]) -> str | None:
+    der = ind.der_from_pem(block)
+    return ind.first_match(ind.cert_keys(der), bad) if der else None
+
+
 def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 # ---------------------------------------------------------------------- stores
-def store_result(name, kind, location, version, fps, bad, note=""):
-    found = sorted({fp for fp in fps if fp in bad})
+def store_result(name, kind, location, version, certs, bad, note=""):
+    """certs: one list of lookup keys per certificate (see keys_from_pem_text)."""
+    hits = (ind.first_match(keys, bad) for keys in certs)
+    found = sorted({h for h in hits if h})
     return {
         "store": name,
         "kind": kind,
         "location": location,
         "version": version,
-        "total": len(fps),
+        "total": len(certs),
         "status": "PRESENT" if found else "absent",
         "found": [{"sha256": fp, "label": bad[fp]} for fp in found],
         "note": note,
@@ -136,7 +175,7 @@ def audit_pem_file(name, path, version, bad, kind="pem-file"):
         text = p.read_text(errors="replace")
     except OSError as exc:
         return skipped(name, f"cannot read {path}: {exc.strerror}")
-    return store_result(name, kind, path, version, fps_from_pem_text(text), bad)
+    return store_result(name, kind, path, version, keys_from_pem_text(text), bad)
 
 
 def debian_version():
@@ -163,7 +202,7 @@ def audit_keychain(bad, keychain=MACOS_ROOTS_KEYCHAIN):
     if r.returncode != 0:
         return skipped(name, "security find-certificate failed")
     res = store_result(name, "keychain", keychain, macos_version(),
-                       fps_from_pem_text(r.stdout), bad,
+                       keys_from_pem_text(r.stdout), bad,
                        note="read-only; Apple manages this keychain (fix via OS update)")
     return res
 
@@ -207,8 +246,11 @@ def audit_node(bad, node="node"):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=envv)
     if r.returncode != 0:
         return skipped(name, "node failed to print tls.rootCertificates")
-    data = json.loads(r.stdout)
-    fps = fps_from_pem_text("\n".join(data["c"]))
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return skipped(name, "node printed unexpected output")
+    fps = keys_from_pem_text("\n".join(data["c"]))
     note = "compiled into the binary; see Node guidance"
     if "--use-openssl-ca" in os.environ.get("NODE_OPTIONS", ""):
         note += "; NODE_OPTIONS sets --use-openssl-ca in this shell"
@@ -256,7 +298,7 @@ def audit_java(bad, storepass="changeit"):
         if r.returncode != 0:
             out.append(skipped(f"java-cacerts ({s})", "keytool -list failed"))
             continue
-        fps = parse_keytool(r.stdout)
+        fps = [[fp] for fp in parse_keytool(r.stdout)]
         out.append(store_result("java-cacerts", "java", str(s), ver, fps, bad,
                                 note="fix: keytool -delete -alias <alias> (needs --apply by hand)"))
     return out
@@ -268,14 +310,38 @@ def audit_all(bad, args) -> list[dict]:
         for b in args.bundle:
             results.append(audit_pem_file(f"custom ({b})", b, "n/a", bad))
         if args.only_bundles:
-            return results
+            return results + sweep_extras(bad, args)
     results.append(audit_pem_file("debian-system-bundle", DEBIAN_BUNDLE, debian_version(), bad))
     results.append(audit_pem_file("macos-cert.pem", MACOS_CERT_PEM, macos_version(), bad))
     results.append(audit_keychain(bad))
     results.extend(audit_certifi(bad, args.python))
     results.append(audit_node(bad))
     results.extend(audit_java(bad))
+    results.extend(sweep_extras(bad, args))
     return results
+
+
+def sweep_extras(bad, args) -> list[dict]:
+    """Optional sweeps: directories, binaries/apps, lockfiles, deployed sites."""
+    if not (args.scan or args.projects or args.apps or args.site or args.ct):
+        return []
+    _, entries = ind.load_preset_json(args.preset_json)
+    patterns = ind.binary_patterns(entries)
+    rules = tsa_versions.load_rules(args.patched)
+    out = []
+    for d in (args.scan or []) + (args.projects or []):
+        out.extend(tsa_scan.sweep_dir(Path(d).expanduser(), bad, patterns, rules))
+    for d in args.projects or []:
+        out.extend(tsa_scan.sweep_lockfiles(Path(d).expanduser(), rules))
+    if args.apps:
+        out.extend(tsa_scan.audit_electron(app, patterns, rules) for app in tsa_scan.electron_apps())
+        out.extend(tsa_scan.audit_cli_tools(patterns, rules))
+        out.extend(tsa_scan.audit_node_installs(rules))
+    out.extend(tsa_sites.audit_site(s, bad) for s in args.site or [])
+    out.extend(tsa_sites.audit_ct(s) for s in args.ct or [])
+    for r in out:
+        r["sweep"] = True
+    return out
 
 
 # ------------------------------------------------------------------------ live
@@ -311,7 +377,7 @@ def live_node(host: str, use_openssl_ca: bool, timeout=15) -> str:
 def live_tests(hosts, results) -> list[dict]:
     clients = [("python default", lambda h: live_python(h, None))]
     for r in results:
-        if r.get("kind") == "pem-file":
+        if r.get("kind") == "pem-file" and not r.get("sweep"):
             loc = r["location"]
             clients.append((f"python cafile={r['store']}", lambda h, loc=loc: live_python(h, loc)))
     if shutil.which("node"):
@@ -325,22 +391,74 @@ def live_tests(hosts, results) -> list[dict]:
 
 
 # ------------------------------------------------------------------------- fix
-def filter_bundle(text: str, bad: dict[str, str]):
-    """Return (new_text, before, removed_fps, after). Drops each matching block
-    plus the label/comment lines directly above it."""
-    blocks = pem_blocks(text)
-    removed = []
-    res = text
-    for b in blocks:
-        try:
-            fp = pem_fp(b)
-        except ValueError:
+def block_spans(lines: list[str]) -> list[tuple[int, int]]:
+    """(begin, end) line indexes of every PEM certificate block."""
+    spans, begin = [], None
+    for i, line in enumerate(lines):
+        if line.startswith(PEM_BEGIN):
+            begin = i
+        elif line.startswith(PEM_END) and begin is not None:
+            spans.append((begin, i))
+            begin = None
+    return spans
+
+
+def entry_start(lines: list[str], begin: int, floor: int) -> int:
+    """First line of the entry owning the block at begin. macOS cert.pem entries
+    start at a '=== /subject' line followed by an openssl text dump that contains
+    blank lines; other bundles have label lines directly above the block."""
+    for i in range(begin - 1, floor - 1, -1):
+        if lines[i].startswith(ENTRY_HEADER):
+            return i
+    start = begin
+    while start > floor and lines[start - 1].strip() and not lines[start - 1].startswith("-"):
+        start -= 1
+    return start
+
+
+def certless_groups(lines: list[str], drop: set[int]) -> set[int]:
+    """Indexes of '### group' header lines with no certificate left under them."""
+    empty, current, has_cert = set(), None, False
+    for i, line in enumerate(lines):
+        if i in drop:
             continue
-        if fp in bad:
+        if line.startswith(GROUP_HEADER):
+            if current is not None and not has_cert:
+                empty.add(current)
+            current, has_cert = i, False
+        elif line.startswith(PEM_BEGIN):
+            has_cert = True
+    if current is not None and not has_cert:
+        empty.add(current)
+    return empty
+
+
+def drop_with_blank(lines: list[str], idx: int, drop: set[int]):
+    drop.add(idx)
+    if idx + 1 < len(lines) and not lines[idx + 1].strip():
+        drop.add(idx + 1)
+
+
+def filter_bundle(text: str, bad: dict[str, str]):
+    """Return (new_text, before, removed_fps, after). Drops each matching
+    certificate with its whole entry (labels or macOS '===' header and text
+    dump), and any '###' group header that loses its last certificate."""
+    lines = text.splitlines(keepends=True)
+    spans = block_spans(lines)
+    drop: set[int] = set()
+    removed = []
+    prev_end = -1
+    for begin, end in spans:
+        fp = block_hit("".join(lines[begin:end + 1]), bad)
+        if fp:
             removed.append(fp)
-            res = re.sub(r"(?:^[^\n-][^\n]*\n)*" + re.escape(b), "", res, count=1, flags=re.M)
-    after = pem_blocks(res)
-    return res, len(blocks), removed, len(after)
+            drop.update(range(entry_start(lines, begin, prev_end + 1), end))
+            drop_with_blank(lines, end, drop)
+        prev_end = end
+    for idx in certless_groups(lines, drop) - certless_groups(lines, set()):
+        drop_with_blank(lines, idx, drop)
+    res = "".join(line for i, line in enumerate(lines) if i not in drop)
+    return res, len(spans), removed, len(pem_blocks(res))
 
 
 def verify_filter(before, removed, after, new_text, bad, expect):
@@ -348,8 +466,8 @@ def verify_filter(before, removed, after, new_text, bad, expect):
         return f"expected to remove exactly {expect}, matched {len(removed)}"
     if after != before - len(removed):
         return f"count mismatch: before={before} removed={len(removed)} after={after}"
-    if any(fp in bad for fp in fps_from_pem_text(new_text)):
-        return "a distrusted root is still present after filtering"
+    if any(block_hit(b, bad) for b in pem_blocks(new_text)):
+        return "a distrusted certificate is still present after filtering"
     return None
 
 
@@ -416,8 +534,7 @@ def cmd_fix(args, bad) -> int:
     if r.returncode != 0:
         print("ABORT: install failed; original left in place", file=sys.stderr)
         return 3
-    left = [fp for fp in fps_from_pem_text(target.read_text()) if fp in bad]
-    if left:
+    if any(block_hit(b, bad) for b in pem_blocks(target.read_text())):
         print("ERROR: distrusted root still present after install; run the undo script",
               file=sys.stderr)
         return 3
@@ -432,9 +549,17 @@ def cmd_fix(args, bad) -> int:
 
 
 # ------------------------------------------------------------------------- cli
-def print_table(results):
+def is_problem(r) -> bool:
+    return r["status"] in PROBLEM_STATUSES
+
+
+def print_table(results, verbose=False):
+    shown = [r for r in results if verbose or not r.get("sweep") or r["status"] not in QUIET_STATUSES]
+    hidden = len(results) - len(shown)
     print(f"{'STORE':34} {'STATUS':8} {'CERTS':>5}  VERSION")
-    for r in results:
+    if hidden:
+        print(f"({hidden} clean sweep results hidden; --verbose shows them)")
+    for r in shown:
         print(f"{r['store'][:34]:34} {r['status']:8} {str(r.get('total', '-')):>5}  "
               f"{r.get('version', '')}")
         if r.get("location"):
@@ -443,10 +568,25 @@ def print_table(results):
             print(f"{'':34}   ! {f['sha256']}  {f['label']}")
         if r.get("note"):
             print(f"{'':34}   ({r['note']})")
+    print_summary(results)
+
+
+def print_summary(results):
+    counts: dict[tuple[str, str], int] = {}
+    for r in results:
+        if r["status"] in PROBLEM_STATUSES or r["status"] == "REBUILD":
+            key = (r["status"], r.get("kind", r["store"]))
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        print("\nSUMMARY: nothing affected found.")
+        return
+    print("\nSUMMARY")
+    for (status, kind), n in sorted(counts.items()):
+        print(f"  {status:8} {n:4}  {kind}")
 
 
 def default_preset():
-    return str(HERE / "presets" / "emudhra-2026.txt")
+    return str(HERE / "presets" / "emudhra-2026.json")
 
 
 def main(argv=None) -> int:
@@ -461,12 +601,28 @@ def main(argv=None) -> int:
     a = sub.add_parser("audit", help="report distrusted roots per store (read-only)")
     common(a)
     a.add_argument("--bundle", action="append", help="also audit this PEM bundle (repeatable)")
-    a.add_argument("--only-bundles", action="store_true", help="audit only --bundle files")
+    a.add_argument("--only-bundles", action="store_true",
+                   help="skip the built-in stores: audit only --bundle files and the sweep options")
     a.add_argument("--python", action="append", default=None,
                    help="interpreter(s) to check for certifi (default: python3)")
     a.add_argument("--live", action="store_true", help="also test live TLS to known-bad hosts")
     a.add_argument("--hosts", default=str(HERE / "presets" / "emudhra-2026-hosts.txt"))
     a.add_argument("--json", action="store_true", help="JSON output")
+    a.add_argument("--scan", action="append", metavar="DIR",
+                   help="sweep DIR for CA bundles, keystores and pip/certifi installs")
+    a.add_argument("--projects", action="append", metavar="DIR",
+                   help="like --scan, plus lockfiles and Dockerfiles of the projects under DIR")
+    a.add_argument("--apps", action="store_true",
+                   help="Electron apps, runtimes (node, uv, go, ...) and roots embedded in their binaries")
+    a.add_argument("--site", action="append", metavar="HOST",
+                   help="check the certificate chain HOST serves (repeatable)")
+    a.add_argument("--ct", action="append", metavar="DOMAIN",
+                   help="search crt.sh for unexpired eMudhra certificates for DOMAIN and subdomains")
+    a.add_argument("--preset-json", default=default_preset(),
+                   help="certificate preset used for binary and key matching")
+    a.add_argument("--patched", default=str(HERE / "presets" / "emudhra-2026-patched.json"),
+                   help="patched-versions table")
+    a.add_argument("--verbose", "-v", action="store_true", help="also list clean sweep results")
 
     f = sub.add_parser("fix", help="remove distrusted roots from one PEM bundle")
     common(f)
@@ -494,14 +650,14 @@ def main(argv=None) -> int:
                           "stores": results, "live": live}, indent=2))
     else:
         print(f"trust-store-audit {__version__}: checking {len(bad)} fingerprint(s)\n")
-        print_table(results)
+        print_table(results, args.verbose)
         if live:
             print(f"\n{'HOST':48} {'CLIENT':40} RESULT")
             for row in live:
                 print(f"{row['host'][:48]:48} {row['client'][:40]:40} {row['result']}")
         if any(r["status"] == "PRESENT" and r["kind"] == "node" for r in results):
             print("\n" + NODE_GUIDANCE)
-    present = any(r["status"] == "PRESENT" for r in results)
+    present = any(is_problem(r) for r in results)
     accepted = any(row["result"] == "ACCEPTED" for row in live)
     return 1 if (present or accepted) else 0
 
