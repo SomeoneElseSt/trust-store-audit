@@ -47,4 +47,4 @@ def check(rules: dict, package: str, version: str) -> tuple[str, str]:
     newest_line = max(parse(k) for k in mins)
     if parse(key) > newest_line:
         return OK, "newer than every listed release line"
-    return OUTDATED, f"release line {key} has no fix; upgrade to a patched line ({', '.join(mins.values())})"
+    return OUTDATED, f"{key}.x gets no fix; needs one of {', '.join(mins.values())}"

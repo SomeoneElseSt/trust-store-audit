@@ -119,7 +119,7 @@ def main() -> int:
         status, why = ver.check(rules, "electron", installed)
         staged = shipit_staged(app) or updater_staged(app)
         app_version = app_info(app, "CFBundleShortVersionString")
-        note = staged_note(rules, app_version, installed, staged) or ("" if status == ver.OK else why)
+        note = staged_note(rules, app_version, installed, staged) or ("" if status == ver.OK else why + " (vendor must ship it)")
         rows.append((status != ver.OK, app.stem, installed, STATUS_LABEL[status], note))
     rows.sort(key=lambda r: (not r[0], r[1].lower()))
     print(f"Electron patch status  {datetime.now():%Y-%m-%d %H:%M}   "
